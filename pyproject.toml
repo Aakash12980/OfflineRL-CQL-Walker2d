@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "offlinerl-cql-walker2d"
+version = "0.1.0"
+description = "Offline Reinforcement Learning with CQL on Walker2d for thesis exploration"
+authors = ["Aakash Bhandari <bhandariaakash9@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+torch = "^2.7.1"
+mujoco-py = "^2.1.2.14"
+minari = {extras = ["hf"], version = "^0.5.3"}
+gymnasium = "1.0.0"
+d3rlpy = "^2.8.1"
+mujoco = "3.2.3"
+
+
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.1.1"
+matplotlib = "^3.10.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
