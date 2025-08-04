@@ -119,7 +119,7 @@ class ComprehensiveRLTrainer:
         """Calculate return threshold for OPC evaluator"""
         returns = []
         for episode in self.dataset.episodes:
-            episode_return = sum(step.reward for step in episode)
+            episode_return = np.sum(episode.rewards)
             returns.append(episode_return)
         return np.percentile(returns, 75)
 
