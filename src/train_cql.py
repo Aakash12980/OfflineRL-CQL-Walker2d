@@ -18,7 +18,6 @@ from d3rlpy.metrics import (
     ContinuousActionDiffEvaluator,
     EnvironmentEvaluator,
 )
-from d3rlpy.logging import FileAdapterFactory
 
 
 class ComprehensiveRLTrainer:
@@ -137,7 +136,12 @@ class ComprehensiveRLTrainer:
             done = False
 
             while not done and steps < 1000:
-                action = algo.predict([obs])[0]
+                if obs.ndim == 1:
+                    obs_batch = obs.reshape(1, -1) 
+                else:
+                    obs_batch = obs
+                
+                action = algo.predict(obs_batch)[0]
                 obs, reward, terminated, truncated, _ = self.eval_env.step(
                     action
                 )
@@ -217,20 +221,13 @@ class ComprehensiveRLTrainer:
             soft_q_backup=False,
         )
 
-        cql = cql_config.create(device="cpu")
+        cql = cql_config.create(device="gpu")
 
         # Setup evaluators
         evaluators = self.setup_evaluators()
 
-        # Setup logging
-        log_adapter = FileAdapterFactory(
-            root_dir=os.path.join(
-                self.results_dir, f"cql_logs_{self.timestamp}"
-            )
-        )
-
         # Training with evaluation callbacks
-        def evaluation_callback(algo, epoch):
+        def evaluation_callback(algo, epoch, total_step):
             # Evaluate policy
             eval_results = self.evaluate_policy(algo, "cql", epoch)
 
@@ -258,7 +255,6 @@ class ComprehensiveRLTrainer:
             evaluators=evaluators,
             experiment_name=f"cql_walker2d_{self.timestamp}",
             with_timestamp=False,
-            loggers=[log_adapter],
             save_interval=5,
             callback=evaluation_callback,
         )
@@ -284,7 +280,7 @@ class ComprehensiveRLTrainer:
             learning_rate=1e-3, batch_size=256, weight_decay=1e-4
         )
 
-        bc = bc_config.create(device="cpu")
+        bc = bc_config.create(device="gpu")
 
         # Setup evaluators (subset for BC as it's simpler)
         evaluators = {
@@ -294,15 +290,8 @@ class ComprehensiveRLTrainer:
             ),
         }
 
-        # Setup logging
-        log_adapter = FileAdapterFactory(
-            root_dir=os.path.join(
-                self.results_dir, f"bc_logs_{self.timestamp}"
-            )
-        )
-
         # Training with evaluation callbacks
-        def evaluation_callback(algo, epoch):
+        def evaluation_callback(algo, epoch, total_step):
             eval_results = self.evaluate_policy(algo, "bc", epoch)
             self.save_best_model(algo, "bc", eval_results["mean_score"], epoch)
 
@@ -317,7 +306,6 @@ class ComprehensiveRLTrainer:
             evaluators=evaluators,
             experiment_name=f"bc_walker2d_{self.timestamp}",
             with_timestamp=False,
-            loggers=[log_adapter],
             callback=evaluation_callback,
         )
 
@@ -423,6 +411,34 @@ class ComprehensiveRLTrainer:
         )
         df.to_csv(csv_path, index=False)
         print(f"✓ Evaluation CSV saved to: {csv_path}")
+
+    def _create_training_csv(self):
+        """Create CSV file with training metrics"""
+        training_data = []
+
+        for algo_name in ["cql", "bc"]:
+            if self.training_metrics[algo_name]["epochs"]:
+                epochs = self.training_metrics[algo_name]["epochs"]
+                metrics = self.training_metrics[algo_name]["metrics"]
+                
+                for epoch, metric_dict in zip(epochs, metrics):
+                    row = {
+                        "algorithm": algo_name,
+                        "epoch": epoch,
+                    }
+                    # Add all metrics to the row
+                    if isinstance(metric_dict, dict):
+                        for key, value in metric_dict.items():
+                            row[key] = value
+                    training_data.append(row)
+
+        if training_data:
+            df = pd.DataFrame(training_data)
+            csv_path = os.path.join(
+                self.results_dir, f"training_metrics_{self.timestamp}.csv"
+            )
+            df.to_csv(csv_path, index=False)
+            print(f"✓ Training metrics CSV saved to: {csv_path}")
 
     def _generate_plots(self):
         """Generate comprehensive plots"""
@@ -614,7 +630,7 @@ class ComprehensiveRLTrainer:
                     f"Winner: {'CQL' if cql_score > bc_score else 'BC'}\n\n"
                 )
 
-        print(f"Summary report saved to: {report_path}")
+        print(f"✓ Summary report saved to: {report_path}")
 
     def run_complete_training(self):
         """Run complete training pipeline"""
