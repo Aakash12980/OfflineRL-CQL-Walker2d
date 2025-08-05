@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime
 import pickle
+import torch
 
 from d3rlpy.datasets import get_minari
 import gymnasium as gym
@@ -20,28 +21,34 @@ from d3rlpy.metrics import (
 )
 
 
-class ComprehensiveRLTrainer:
+class OptimizedRLTrainer:
     def __init__(
         self,
         dataset_name: str = "mujoco/walker2d/medium-v0",
         env_name: str = "Walker2d-v5",
         results_dir: str = "results",
+        fast_mode: bool = True,
     ):
         """
-        Initialize the comprehensive RL trainer
+        Initialize the optimized RL trainer
 
         Args:
             dataset_name: Minari dataset name
             env_name: Gym environment name
             results_dir: Directory to save results
+            fast_mode: Enable optimizations for faster training
         """
         self.dataset_name = dataset_name
         self.env_name = env_name
         self.results_dir = results_dir
+        self.fast_mode = fast_mode
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Create results directory
         os.makedirs(self.results_dir, exist_ok=True)
+
+        # Check and setup device
+        self.device = self._setup_device()
 
         # Load dataset and environment
         print(f"Loading dataset: {dataset_name}")
@@ -50,6 +57,10 @@ class ComprehensiveRLTrainer:
         print(f"Creating environment: {env_name}")
         self.env = gym.make(env_name)
         self.eval_env = gym.make(env_name)
+
+        # Optimize dataset for faster training
+        if self.fast_mode:
+            self._optimize_dataset()
 
         # Initialize metrics storage
         self.training_metrics = {
@@ -65,43 +76,86 @@ class ComprehensiveRLTrainer:
             "bc": {"score": -np.inf, "epoch": 0, "model_path": None},
         }
 
-    def setup_evaluators(self):
-        """Setup comprehensive evaluators for training and evaluation"""
+    def _setup_device(self):
+        """Setup optimal device for training"""
+        if torch.cuda.is_available():
+            device = "cuda:0"
+            print(f"✓ Using GPU: {torch.cuda.get_device_name(0)}")
+            # Optimize CUDA settings
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
+        else:
+            device = "cpu"
+            print("⚠ Using CPU (GPU not available)")
 
-        # Environment evaluator for policy evaluation
+        return device
+
+    def _optimize_dataset(self):
+        """Optimize dataset for faster training"""
+        print("Optimizing dataset for fast training...")
+
+        # Limit dataset size for faster training
+        max_episodes = 500  # Reduce from full dataset
+        if len(self.dataset.episodes) > max_episodes:
+            print(
+                f"  Reducing dataset from {len(self.dataset.episodes)} to {max_episodes} episodes"
+            )
+            # Keep episodes with diverse returns
+            returns = [np.sum(ep.rewards) for ep in self.dataset.episodes]
+            indices = np.argsort(returns)
+            # Take episodes from different performance levels
+            selected_indices = []
+            step = len(indices) // max_episodes
+            for i in range(0, len(indices), max(1, step)):
+                selected_indices.append(indices[i])
+                if len(selected_indices) >= max_episodes:
+                    break
+
+            self.dataset.episodes = [
+                self.dataset.episodes[i]
+                for i in selected_indices[:max_episodes]
+            ]
+
+        print(f"  Final dataset size: {len(self.dataset.episodes)} episodes")
+        print(f"  Total steps: {sum(len(ep) for ep in self.dataset.episodes)}")
+
+    def setup_evaluators(self, lightweight: bool = False):
+        """Setup evaluators with optimizations"""
+        if lightweight:
+            # Minimal evaluators for fast training
+            return {
+                "environment": EnvironmentEvaluator(
+                    self.eval_env,
+                    n_trials=3,
+                    epsilon=0.0,
+                )
+            }
+
+        # Standard evaluators but with reduced complexity
         env_evaluator = EnvironmentEvaluator(
             self.eval_env,
-            n_trials=10,
+            n_trials=5,
             epsilon=0.0,
         )
 
-        # TD Error evaluator
-        td_error_evaluator = TDErrorEvaluator(
-            episodes=self.dataset.episodes[:100]
-        )
+        # Use smaller subset for other evaluators
+        eval_episodes = self.dataset.episodes[:50]
 
-        # Value estimation evaluators
+        td_error_evaluator = TDErrorEvaluator(episodes=eval_episodes)
         avg_value_evaluator = AverageValueEstimationEvaluator(
-            episodes=self.dataset.episodes[:100]
+            episodes=eval_episodes
         )
-
         initial_value_evaluator = InitialStateValueEstimationEvaluator(
-            episodes=self.dataset.episodes[:100]
+            episodes=eval_episodes
         )
-
-        # Advantage estimator
         advantage_evaluator = DiscountedSumOfAdvantageEvaluator(
-            episodes=self.dataset.episodes[:100]
+            episodes=eval_episodes
         )
-
-        # OPC evaluator for offline policy evaluation
         opc_evaluator = SoftOPCEvaluator(
             return_threshold=self.calculate_return_threshold()
         )
-
-        # Action difference evaluator
         action_diff_evaluator = ContinuousActionDiffEvaluator(
-            episodes=self.dataset.episodes[:100]
+            episodes=eval_episodes
         )
 
         return {
@@ -122,25 +176,33 @@ class ComprehensiveRLTrainer:
             returns.append(episode_return)
         return np.percentile(returns, 75)
 
-    def evaluate_policy(self, algo, algo_name: str, epoch: int):
-        """Comprehensive policy evaluation"""
-        print(f"\nEvaluating {algo_name} at epoch {epoch}...")
+    def evaluate_policy(
+        self, algo, algo_name: str, epoch: int, n_trials: int = None
+    ):
+        """Optimized policy evaluation"""
+        if n_trials is None:
+            n_trials = 3 if self.fast_mode else 10
+
+        print(
+            f"\nEvaluating {algo_name} at epoch {epoch} ({n_trials} trials)..."
+        )
 
         eval_scores = []
         eval_lengths = []
 
-        for trial in range(10):
+        for trial in range(n_trials):
             obs, _ = self.eval_env.reset()
             total_reward = 0
             steps = 0
             done = False
+            max_steps = 500 if self.fast_mode else 1000
 
-            while not done and steps < 1000:
+            while not done and steps < max_steps:
                 if obs.ndim == 1:
-                    obs_batch = obs.reshape(1, -1) 
+                    obs_batch = obs.reshape(1, -1)
                 else:
                     obs_batch = obs
-                
+
                 action = algo.predict(obs_batch)[0]
                 obs, reward, terminated, truncated, _ = self.eval_env.step(
                     action
@@ -192,62 +254,72 @@ class ComprehensiveRLTrainer:
             )
 
             print(
-                f"✓ New best {algo_name} model saved! Score: {score:.2f} at epoch {epoch}"
+                f"New best {algo_name} model saved! Score: {score:.2f} at epoch {epoch}"
             )
             return True
         return False
 
-    def train_cql(self, n_steps: int = 100000, n_steps_per_epoch: int = 10000):
-        """Train CQL algorithm with comprehensive evaluation"""
+    def train_cql(self, n_steps: int = None, n_steps_per_epoch: int = None):
+        """Train CQL algorithm with optimizations"""
         print("\n" + "=" * 50)
         print("TRAINING CQL ALGORITHM")
         print("=" * 50)
 
-        # Setup CQL with optimized hyperparameters
+        # training parameters
+        if self.fast_mode:
+            n_steps = n_steps or 30000
+            n_steps_per_epoch = n_steps_per_epoch or 3000
+            print("Fast mode enabled - using reduced training steps")
+        else:
+            n_steps = n_steps or 100000
+            n_steps_per_epoch = n_steps_per_epoch or 10000
+
+        # Optimized CQL configuration
         cql_config = CQLConfig(
-            actor_learning_rate=3e-4,
-            critic_learning_rate=3e-4,
-            temp_learning_rate=3e-4,
-            alpha_learning_rate=3e-4,
-            batch_size=256,
+            actor_learning_rate=1e-3,
+            critic_learning_rate=1e-3,
+            temp_learning_rate=1e-3,
+            alpha_learning_rate=1e-3,
+            batch_size=(512 if self.device.startswith("cuda") else 256),
             gamma=0.99,
             tau=0.005,
             n_critics=2,
             initial_temperature=1.0,
-            initial_alpha=5.0,
-            alpha_threshold=10.0,
-            conservative_weight=5.0,
-            n_action_samples=10,
+            initial_alpha=2.0,
+            alpha_threshold=5.0,
+            conservative_weight=2.0,
+            n_action_samples=5,
             soft_q_backup=False,
         )
 
-        cql = cql_config.create(device="gpu")
+        cql = cql_config.create(device=self.device)
 
-        # Setup evaluators
-        evaluators = self.setup_evaluators()
+        # Setup lightweight evaluators for fast training
+        evaluators = self.setup_evaluators(lightweight=self.fast_mode)
 
-        # Training with evaluation callbacks
+        # Optimized training callback
+        eval_frequency = 3 if self.fast_mode else 1
+
         def evaluation_callback(algo, epoch, total_step):
-            # Evaluate policy
-            eval_results = self.evaluate_policy(algo, "cql", epoch)
+            if epoch % eval_frequency == 0:
+                eval_results = self.evaluate_policy(algo, "cql", epoch)
+                self.save_best_model(
+                    algo, "cql", eval_results["mean_score"], epoch
+                )
 
-            # Save best model
-            self.save_best_model(
-                algo, "cql", eval_results["mean_score"], epoch
-            )
-
-            # Save checkpoint every 10 epochs
-            if epoch % 10 == 0:
+            # Save checkpoints less frequently
+            if epoch % 20 == 0:
                 checkpoint_path = os.path.join(
                     self.results_dir,
                     f"cql_checkpoint_epoch_{epoch}_{self.timestamp}.d3",
                 )
                 algo.save(checkpoint_path)
 
-        # Train CQL
         print(
             f"Training CQL for {n_steps} steps ({n_steps//n_steps_per_epoch} epochs)..."
         )
+        print(f"Device: {self.device}")
+
         epochs, metrics = cql.fit(
             self.dataset,
             n_steps=n_steps,
@@ -255,11 +327,10 @@ class ComprehensiveRLTrainer:
             evaluators=evaluators,
             experiment_name=f"cql_walker2d_{self.timestamp}",
             with_timestamp=False,
-            save_interval=5,
+            save_interval=10,
             callback=evaluation_callback,
         )
 
-        # Store training metrics
         self.training_metrics["cql"]["epochs"] = epochs
         self.training_metrics["cql"]["metrics"] = metrics
 
@@ -269,33 +340,40 @@ class ComprehensiveRLTrainer:
 
         return cql, epochs, metrics
 
-    def train_bc(self, n_steps: int = 20000, n_steps_per_epoch: int = 2000):
-        """Train BC algorithm with comprehensive evaluation"""
+    def train_bc(self, n_steps: int = None, n_steps_per_epoch: int = None):
+        """Train BC algorithm"""
         print("\n" + "=" * 50)
-        print("TRAINING BC ALGORITHM (Baseline)")
+        print("TRAINING BC ALGORITHM")
         print("=" * 50)
 
-        # Setup BC with optimized hyperparameters
+        # training parameters
+        if self.fast_mode:
+            n_steps = n_steps or 10000
+            n_steps_per_epoch = n_steps_per_epoch or 1000
+        else:
+            n_steps = n_steps or 20000
+            n_steps_per_epoch = n_steps_per_epoch or 2000
+
         bc_config = BCConfig(
-            learning_rate=1e-3, batch_size=256, weight_decay=1e-4
+            learning_rate=3e-3,
+            batch_size=512 if self.device.startswith("cuda") else 256,
+            weight_decay=1e-4,
         )
 
-        bc = bc_config.create(device="gpu")
+        bc = bc_config.create(device=self.device)
 
-        # Setup evaluators (subset for BC as it's simpler)
+        # Minimal evaluators for BC
         evaluators = {
-            "environment": EnvironmentEvaluator(self.eval_env, n_trials=5),
-            "action_diff": ContinuousActionDiffEvaluator(
-                episodes=self.dataset.episodes[:50]
-            ),
+            "environment": EnvironmentEvaluator(self.eval_env, n_trials=3),
         }
 
-        # Training with evaluation callbacks
         def evaluation_callback(algo, epoch, total_step):
-            eval_results = self.evaluate_policy(algo, "bc", epoch)
-            self.save_best_model(algo, "bc", eval_results["mean_score"], epoch)
+            if epoch % 2 == 0:
+                eval_results = self.evaluate_policy(algo, "bc", epoch)
+                self.save_best_model(
+                    algo, "bc", eval_results["mean_score"], epoch
+                )
 
-        # Train BC
         print(
             f"Training BC for {n_steps} steps ({n_steps//n_steps_per_epoch} epochs)..."
         )
@@ -309,7 +387,6 @@ class ComprehensiveRLTrainer:
             callback=evaluation_callback,
         )
 
-        # Store training metrics
         self.training_metrics["bc"]["epochs"] = epochs
         self.training_metrics["bc"]["metrics"] = metrics
 
@@ -325,11 +402,12 @@ class ComprehensiveRLTrainer:
         print("SAVING COMPREHENSIVE RESULTS")
         print("=" * 50)
 
-        # Create comprehensive results dictionary
         results = {
             "timestamp": self.timestamp,
             "dataset_name": self.dataset_name,
             "env_name": self.env_name,
+            "fast_mode": self.fast_mode,
+            "device": self.device,
             "training_metrics": self.training_metrics,
             "evaluation_results": self.evaluation_results,
             "best_models": self.best_models,
@@ -343,7 +421,7 @@ class ComprehensiveRLTrainer:
 
         # Save JSON results
         json_path = os.path.join(
-            self.results_dir, f"comprehensive_results_{self.timestamp}.json"
+            self.results_dir, f"optimized_results_{self.timestamp}.json"
         )
         with open(json_path, "w") as f:
             json_results = self._convert_numpy_to_list(results)
@@ -351,26 +429,18 @@ class ComprehensiveRLTrainer:
 
         # Save pickle results
         pickle_path = os.path.join(
-            self.results_dir, f"comprehensive_results_{self.timestamp}.pkl"
+            self.results_dir, f"optimized_results_{self.timestamp}.pkl"
         )
         with open(pickle_path, "wb") as f:
             pickle.dump(results, f)
 
-        # Create evaluation summary CSV
         self._create_evaluation_csv()
-
-        # Create training metrics CSV
         self._create_training_csv()
-
-        # Generate plots
         self._generate_plots()
-
-        # Create summary report
         self._create_summary_report()
 
         print(f"✓ Results saved to: {json_path}")
         print(f"✓ Results saved to: {pickle_path}")
-        print(f"✓ CSV files and plots generated in: {self.results_dir}")
 
     def _convert_numpy_to_list(self, obj):
         """Recursively convert numpy arrays to lists for JSON serialization"""
@@ -389,7 +459,6 @@ class ComprehensiveRLTrainer:
     def _create_evaluation_csv(self):
         """Create CSV file with evaluation results"""
         eval_data = []
-
         for algo_name in ["cql", "bc"]:
             for result in self.evaluation_results[algo_name]:
                 eval_data.append(
@@ -415,18 +484,13 @@ class ComprehensiveRLTrainer:
     def _create_training_csv(self):
         """Create CSV file with training metrics"""
         training_data = []
-
         for algo_name in ["cql", "bc"]:
             if self.training_metrics[algo_name]["epochs"]:
                 epochs = self.training_metrics[algo_name]["epochs"]
                 metrics = self.training_metrics[algo_name]["metrics"]
-                
+
                 for epoch, metric_dict in zip(epochs, metrics):
-                    row = {
-                        "algorithm": algo_name,
-                        "epoch": epoch,
-                    }
-                    # Add all metrics to the row
+                    row = {"algorithm": algo_name, "epoch": epoch}
                     if isinstance(metric_dict, dict):
                         for key, value in metric_dict.items():
                             row[key] = value
@@ -441,20 +505,11 @@ class ComprehensiveRLTrainer:
             print(f"✓ Training metrics CSV saved to: {csv_path}")
 
     def _generate_plots(self):
-        """Generate comprehensive plots"""
-        plt.style.use(
-            "seaborn-v0_8"
-            if "seaborn-v0_8" in plt.style.available
-            else "default"
-        )
+        """Generate optimized plots"""
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.suptitle(f"Training Results - {self.timestamp}", fontsize=14)
 
-        # Plot 1: Training curves comparison
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle(
-            f"Training Results Comparison - {self.timestamp}", fontsize=16
-        )
-
-        # Evaluation scores over time
+        # Evaluation scores
         ax1 = axes[0, 0]
         for algo_name in ["cql", "bc"]:
             if self.evaluation_results[algo_name]:
@@ -464,23 +519,13 @@ class ComprehensiveRLTrainer:
                 scores = [
                     r["mean_score"] for r in self.evaluation_results[algo_name]
                 ]
-                stds = [
-                    r["std_score"] for r in self.evaluation_results[algo_name]
-                ]
-
                 ax1.plot(
                     epochs, scores, label=f"{algo_name.upper()}", marker="o"
                 )
-                ax1.fill_between(
-                    epochs,
-                    np.array(scores) - np.array(stds),
-                    np.array(scores) + np.array(stds),
-                    alpha=0.3,
-                )
 
         ax1.set_xlabel("Epoch")
-        ax1.set_ylabel("Mean Evaluation Score")
-        ax1.set_title("Evaluation Scores Over Time")
+        ax1.set_ylabel("Mean Score")
+        ax1.set_title("Evaluation Scores")
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
@@ -495,18 +540,17 @@ class ComprehensiveRLTrainer:
                     r["mean_length"]
                     for r in self.evaluation_results[algo_name]
                 ]
-
                 ax2.plot(
                     epochs, lengths, label=f"{algo_name.upper()}", marker="s"
                 )
 
         ax2.set_xlabel("Epoch")
         ax2.set_ylabel("Mean Episode Length")
-        ax2.set_title("Episode Lengths Over Time")
+        ax2.set_title("Episode Lengths")
         ax2.legend()
         ax2.grid(True, alpha=0.3)
 
-        # Score distributions (latest evaluation)
+        # Score distributions
         ax3 = axes[1, 0]
         for algo_name in ["cql", "bc"]:
             if self.evaluation_results[algo_name]:
@@ -517,156 +561,108 @@ class ComprehensiveRLTrainer:
                     latest_scores,
                     alpha=0.7,
                     label=f"{algo_name.upper()}",
-                    bins=10,
+                    bins=8,
                 )
 
-        ax3.set_xlabel("Evaluation Score")
+        ax3.set_xlabel("Score")
         ax3.set_ylabel("Frequency")
         ax3.set_title("Final Score Distributions")
         ax3.legend()
-        ax3.grid(True, alpha=0.3)
 
         # Best scores comparison
         ax4 = axes[1, 1]
-        algorithms = []
-        best_scores = []
-
+        algorithms, best_scores = [], []
         for algo_name in ["cql", "bc"]:
             if self.best_models[algo_name]["score"] != -np.inf:
                 algorithms.append(algo_name.upper())
                 best_scores.append(self.best_models[algo_name]["score"])
 
         if algorithms:
-            bars = ax4.bar(algorithms, best_scores, color=["blue", "orange"])
+            ax4.bar(algorithms, best_scores, color=["blue", "orange"])
             ax4.set_ylabel("Best Score")
             ax4.set_title("Best Scores Comparison")
-            ax4.grid(True, alpha=0.3, axis="y")
-
-            # Add value labels on bars
-            for bar, score in zip(bars, best_scores):
-                ax4.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(best_scores) * 0.01,
-                    f"{score:.1f}",
-                    ha="center",
-                    va="bottom",
-                )
 
         plt.tight_layout()
         plot_path = os.path.join(
             self.results_dir, f"training_plots_{self.timestamp}.png"
         )
-        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
-
-        print(f"✓ Plots saved to: {plot_path}")
+        print(f"Plots saved to: {plot_path}")
 
     def _create_summary_report(self):
-        """Create a summary report in text format"""
+        """Create a summary report"""
         report_path = os.path.join(
             self.results_dir, f"summary_report_{self.timestamp}.txt"
         )
 
         with open(report_path, "w") as f:
-            f.write("=" * 80 + "\n")
-            f.write("COMPREHENSIVE OFFLINE RL TRAINING REPORT\n")
-            f.write("=" * 80 + "\n\n")
+            f.write("=" * 70 + "\n")
+            f.write("OFFLINE RL TRAINING REPORT\n")
+            f.write("=" * 70 + "\n\n")
 
             f.write(f"Timestamp: {self.timestamp}\n")
             f.write(f"Dataset: {self.dataset_name}\n")
-            f.write(f"Environment: {self.env_name}\n\n")
+            f.write(f"Environment: {self.env_name}\n")
+            f.write(f"Fast Mode: {self.fast_mode}\n")
+            f.write(f"Device: {self.device}\n\n")
 
-            # Dataset statistics
-            f.write("DATASET STATISTICS:\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Number of episodes: {len(self.dataset.episodes)}\n")
+            # Dataset info
+            f.write("DATASET INFO:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Episodes: {len(self.dataset.episodes)}\n")
             f.write(
-                f"Total steps: {sum(len(ep) for ep in self.dataset.episodes)}\n"
+                f"Steps: {sum(len(ep) for ep in self.dataset.episodes)}\n\n"
             )
-            f.write(f"Action space: {self.env.action_space}\n")
-            f.write(f"Observation space: {self.env.observation_space}\n\n")
 
-            # Best models summary
-            f.write("BEST MODELS SUMMARY:\n")
-            f.write("-" * 40 + "\n")
+            # Best models
+            f.write("BEST RESULTS:\n")
+            f.write("-" * 30 + "\n")
             for algo_name in ["cql", "bc"]:
                 best = self.best_models[algo_name]
                 if best["score"] != -np.inf:
-                    f.write(f"{algo_name.upper()}:\n")
-                    f.write(f"  Best Score: {best['score']:.2f}\n")
-                    f.write(f"  Best Epoch: {best['epoch']}\n")
-                    f.write(f"  Model Path: {best['model_path']}\n\n")
-
-            # Final evaluation results
-            f.write("FINAL EVALUATION RESULTS:\n")
-            f.write("-" * 40 + "\n")
-            for algo_name in ["cql", "bc"]:
-                if self.evaluation_results[algo_name]:
-                    final_result = self.evaluation_results[algo_name][-1]
-                    f.write(f"{algo_name.upper()}:\n")
                     f.write(
-                        f"  Mean Score: {final_result['mean_score']:.2f} ± {final_result['std_score']:.2f}\n"
-                    )
-                    f.write(
-                        f"  Score Range: [{final_result['min_score']:.2f}, {final_result['max_score']:.2f}]\n"
-                    )
-                    f.write(
-                        f"  Mean Episode Length: {final_result['mean_length']:.1f} ± {final_result['std_length']:.1f}\n\n"
+                        f"{algo_name.upper()}: {best['score']:.2f} (epoch {best['epoch']})\n"
                     )
 
-            # Comparison
-            if (
-                len(self.evaluation_results["cql"]) > 0
-                and len(self.evaluation_results["bc"]) > 0
-            ):
-                cql_score = self.evaluation_results["cql"][-1]["mean_score"]
-                bc_score = self.evaluation_results["bc"][-1]["mean_score"]
-                improvement = ((cql_score - bc_score) / abs(bc_score)) * 100
-
-                f.write("PERFORMANCE COMPARISON:\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"CQL vs BC improvement: {improvement:.1f}%\n")
-                f.write(
-                    f"Winner: {'CQL' if cql_score > bc_score else 'BC'}\n\n"
-                )
-
-        print(f"✓ Summary report saved to: {report_path}")
+        print(f"Summary report saved to: {report_path}")
 
     def run_complete_training(self):
-        """Run complete training pipeline"""
-        print("Starting comprehensive offline RL training pipeline...")
-        print(f"Results will be saved to: {self.results_dir}")
-        print(f"Timestamp: {self.timestamp}")
+        """Run optimized training pipeline"""
+        print("🚀 Starting offline RL training pipeline...")
+        print(f"Device: {self.device}")
+        print(f"Fast mode: {self.fast_mode}")
+        print(f"Results directory: {self.results_dir}")
 
         cql_model, cql_epochs, cql_metrics = self.train_cql()
         bc_model, bc_epochs, bc_metrics = self.train_bc()
-
         self.save_comprehensive_results()
 
-        print("\n" + "=" * 80)
-        print("TRAINING COMPLETED SUCCESSFULLY!")
-        print("=" * 80)
+        print("\n" + "=" * 60)
+        print("TRAINING COMPLETED!")
+        print("=" * 60)
         print(f"Best CQL Score: {self.best_models['cql']['score']:.2f}")
         print(f"Best BC Score: {self.best_models['bc']['score']:.2f}")
+        print(f"Device used: {self.device}")
         print(f"Results saved in: {self.results_dir}")
-        print("=" * 80)
+        print("=" * 60)
 
         return {
             "cql_model": cql_model,
             "bc_model": bc_model,
             "results_dir": self.results_dir,
             "timestamp": self.timestamp,
+            "device": self.device,
         }
 
 
 if __name__ == "__main__":
-    trainer = ComprehensiveRLTrainer(
+    trainer = OptimizedRLTrainer(
         dataset_name="mujoco/walker2d/medium-v0",
         env_name="Walker2d-v5",
-        results_dir="walker2d_cql_results",
+        results_dir="walker2d_results",
+        fast_mode=True,
     )
 
     results = trainer.run_complete_training()
-
-    print("\nTraining pipeline completed!")
-    print(f"Check the results directory: {results['results_dir']}")
+    print(f"\n✅ Training completed! Check: {results['results_dir']}")
