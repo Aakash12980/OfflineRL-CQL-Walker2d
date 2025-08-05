@@ -58,10 +58,6 @@ class OptimizedRLTrainer:
         self.env = gym.make(env_name)
         self.eval_env = gym.make(env_name)
 
-        # Optimize dataset for faster training
-        if self.fast_mode:
-            self._optimize_dataset()
-
         # Initialize metrics storage
         self.training_metrics = {
             "cql": {"epochs": [], "metrics": []},
@@ -89,35 +85,6 @@ class OptimizedRLTrainer:
             print("⚠ Using CPU (GPU not available)")
 
         return device
-
-    def _optimize_dataset(self):
-        """Optimize dataset for faster training"""
-        print("Optimizing dataset for fast training...")
-
-        # Limit dataset size for faster training
-        max_episodes = 500  # Reduce from full dataset
-        if len(self.dataset.episodes) > max_episodes:
-            print(
-                f"  Reducing dataset from {len(self.dataset.episodes)} to {max_episodes} episodes"
-            )
-            # Keep episodes with diverse returns
-            returns = [np.sum(ep.rewards) for ep in self.dataset.episodes]
-            indices = np.argsort(returns)
-            # Take episodes from different performance levels
-            selected_indices = []
-            step = len(indices) // max_episodes
-            for i in range(0, len(indices), max(1, step)):
-                selected_indices.append(indices[i])
-                if len(selected_indices) >= max_episodes:
-                    break
-
-            self.dataset.episodes = [
-                self.dataset.episodes[i]
-                for i in selected_indices[:max_episodes]
-            ]
-
-        print(f"  Final dataset size: {len(self.dataset.episodes)} episodes")
-        print(f"  Total steps: {sum(len(ep) for ep in self.dataset.episodes)}")
 
     def setup_evaluators(self, lightweight: bool = False):
         """Setup evaluators with optimizations"""
