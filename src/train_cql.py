@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import pickle
 import torch
+import glob
 
 from d3rlpy.datasets import get_minari
 import gymnasium as gym
@@ -21,28 +22,38 @@ from d3rlpy.metrics import (
 )
 
 
-class OptimizedRLTrainer:
+class ImprovedRLTrainer:
     def __init__(
         self,
         dataset_name: str = "mujoco/walker2d/medium-v0",
         env_name: str = "Walker2d-v5",
         results_dir: str = "results",
-        fast_mode: bool = True,
+        fast_mode: bool = False,
+        resume_from_checkpoint: bool = False,
+        checkpoint_dir: str = None,
     ):
         """
-        Initialize the optimized RL trainer
+        Initialize the RL trainer
 
         Args:
-            dataset_name: Minari dataset name
-            env_name: Gym environment name
-            results_dir: Directory to save results
-            fast_mode: Enable optimizations for faster training
+            resume_from_checkpoint: Whether to resume from existing checkpoint
+            checkpoint_dir: Directory to look for checkpoints (if None, uses results_dir)
         """
         self.dataset_name = dataset_name
         self.env_name = env_name
         self.results_dir = results_dir
         self.fast_mode = fast_mode
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.resume_from_checkpoint = resume_from_checkpoint
+        self.checkpoint_dir = checkpoint_dir or results_dir
+
+        # If resuming, try to load existing timestamp, otherwise create new one
+        if resume_from_checkpoint:
+            self.timestamp = (
+                self._find_latest_timestamp()
+                or datetime.now().strftime("%Y%m%d_%H%M%S")
+            )
+        else:
+            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Create results directory
         os.makedirs(self.results_dir, exist_ok=True)
@@ -58,6 +69,12 @@ class OptimizedRLTrainer:
         self.env = gym.make(env_name)
         self.eval_env = gym.make(env_name)
 
+        # Calculate D4RL normalization scores
+        self.min_score, self.max_score = self._calculate_d4rl_scores()
+        print(
+            f"D4RL normalization: min={self.min_score:.2f}, max={self.max_score:.2f}"
+        )
+
         # Initialize metrics storage
         self.training_metrics = {
             "cql": {"epochs": [], "metrics": []},
@@ -68,45 +85,463 @@ class OptimizedRLTrainer:
 
         # Best model tracking
         self.best_models = {
-            "cql": {"score": -np.inf, "epoch": 0, "model_path": None},
-            "bc": {"score": -np.inf, "epoch": 0, "model_path": None},
+            "cql": {
+                "score": -np.inf,
+                "normalized_score": -np.inf,
+                "epoch": 0,
+                "model_path": None,
+            },
+            "bc": {
+                "score": -np.inf,
+                "normalized_score": -np.inf,
+                "epoch": 0,
+                "model_path": None,
+            },
         }
+
+        # Load previous results if resuming
+        if resume_from_checkpoint:
+            self._load_previous_results()
+
+    def _find_latest_timestamp(self):
+        """Find the latest timestamp from existing results"""
+        pattern = os.path.join(self.checkpoint_dir, "improved_results_*.json")
+        result_files = glob.glob(pattern)
+
+        if result_files:
+            # Extract timestamps from filenames and find the latest
+            timestamps = []
+            for file in result_files:
+                filename = os.path.basename(file)
+                # Extract timestamp from filename like "improved_results_20240107_143022.json"
+                if filename.startswith(
+                    "improved_results_"
+                ) and filename.endswith(".json"):
+                    timestamp_part = filename.replace(
+                        "improved_results_", ""
+                    ).replace(".json", "")
+                    timestamps.append(timestamp_part)
+
+            if timestamps:
+                latest_timestamp = max(timestamps)
+                print(
+                    f"Found existing results with timestamp: {latest_timestamp}"
+                )
+                return latest_timestamp
+
+        return None
+
+    def _load_previous_results(self):
+        """Load previous training results and metrics"""
+        results_file = os.path.join(
+            self.checkpoint_dir, f"improved_results_{self.timestamp}.json"
+        )
+
+        if os.path.exists(results_file):
+            print(f"Loading previous results from: {results_file}")
+
+            try:
+                with open(results_file, "r") as f:
+                    previous_results = json.load(f)
+
+                # Restore training metrics
+                if "training_metrics" in previous_results:
+                    self.training_metrics = previous_results[
+                        "training_metrics"
+                    ]
+
+                # Restore evaluation results
+                if "evaluation_results" in previous_results:
+                    self.evaluation_results = previous_results[
+                        "evaluation_results"
+                    ]
+
+                # Restore best models
+                if "best_models" in previous_results:
+                    self.best_models = previous_results["best_models"]
+
+                print("✅ Previous results loaded successfully!")
+                print(
+                    f"CQL: {len(self.evaluation_results.get('cql', []))} evaluations"
+                )
+                print(
+                    f"BC: {len(self.evaluation_results.get('bc', []))} evaluations"
+                )
+
+            except Exception as e:
+                print(f"⚠️ Warning: Could not load previous results: {e}")
+        else:
+            print(f"No previous results found at: {results_file}")
+
+    def _find_latest_checkpoint(self, algo_name: str):
+        """Find the latest checkpoint for a given algorithm"""
+        pattern = os.path.join(
+            self.checkpoint_dir,
+            f"{algo_name}_checkpoint_epoch_*_{self.timestamp}.d3",
+        )
+        checkpoint_files = glob.glob(pattern)
+
+        if not checkpoint_files:
+            # Also try to find checkpoints with any timestamp
+            pattern = os.path.join(
+                self.checkpoint_dir, f"{algo_name}_checkpoint_epoch_*.d3"
+            )
+            checkpoint_files = glob.glob(pattern)
+
+        if checkpoint_files:
+            # Extract epoch numbers and find the latest
+            latest_checkpoint = None
+            latest_epoch = -1
+
+            for checkpoint_file in checkpoint_files:
+                try:
+                    # Extract epoch number from filename
+                    filename = os.path.basename(checkpoint_file)
+                    # Filename format: algo_checkpoint_epoch_EPOCH_timestamp.d3
+                    parts = filename.split("_")
+                    epoch_idx = parts.index("epoch") + 1
+                    epoch_num = int(parts[epoch_idx])
+
+                    if epoch_num > latest_epoch:
+                        latest_epoch = epoch_num
+                        latest_checkpoint = checkpoint_file
+
+                except (ValueError, IndexError):
+                    continue
+
+            if latest_checkpoint:
+                print(
+                    f"Found {algo_name.upper()} checkpoint at epoch {latest_epoch}: {latest_checkpoint}"
+                )
+                return latest_checkpoint, latest_epoch
+
+        return None, 0
+
+    def _load_checkpoint(self, algo, checkpoint_path):
+        """Load a checkpoint into the algorithm"""
+        try:
+            print(f"Loading checkpoint: {checkpoint_path}")
+            algo.load(checkpoint_path)
+            print("✅ Checkpoint loaded successfully!")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to load checkpoint: {e}")
+            return False
 
     def _setup_device(self):
         """Setup optimal device for training"""
         if torch.cuda.is_available():
             device = "cuda:0"
-            print(f"✓ Using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
             # Optimize CUDA settings
             torch.backends.cudnn.benchmark = True
             torch.backends.cudnn.deterministic = False
         else:
             device = "cpu"
-            print("⚠ Using CPU (GPU not available)")
+            print("Using CPU (GPU not available)")
 
         return device
+
+    def _calculate_d4rl_scores(self):
+        """Calculate min/max scores for D4RL normalization"""
+        # For Walker2d-medium, these are approximate D4RL normalization values
+        # Based on literature values for proper comparison
+        min_score = 1.629  # Random policy score
+        max_score = 4592.3  # Expert policy score
+        return min_score, max_score
+
+    def normalize_d4rl_score(self, raw_score):
+        """Convert raw score to D4RL normalized score (0-100+)"""
+        return (
+            100
+            * (raw_score - self.min_score)
+            / (self.max_score - self.min_score)
+        )
+
+    def train_cql(self, n_steps: int = None, n_steps_per_epoch: int = None):
+        """Train CQL model"""
+        print("\n" + "=" * 50)
+        print("TRAINING CQL ALGORITHM")
+        print("=" * 50)
+
+        # Improved training parameters
+        if self.fast_mode:
+            n_steps = n_steps or 100000
+            n_steps_per_epoch = n_steps_per_epoch or 5000
+            print("Fast mode enabled - using moderate training steps")
+        else:
+            n_steps = n_steps or 1000000
+            n_steps_per_epoch = n_steps_per_epoch or 10000
+
+        # Create CQL configuration
+        cql_config = CQLConfig(
+            actor_learning_rate=3e-4,
+            critic_learning_rate=3e-4,
+            temp_learning_rate=3e-4,
+            alpha_learning_rate=3e-4,
+            batch_size=512 if self.device.startswith("cuda") else 256,
+            gamma=0.99,
+            tau=0.005,
+            n_critics=2,
+            initial_temperature=1.0,
+            initial_alpha=5.0,
+            alpha_threshold=10.0,
+            conservative_weight=5.0,
+            n_action_samples=10,
+            soft_q_backup=True,
+        )
+
+        cql = cql_config.create(device=self.device)
+
+        # Check for checkpoint resumption
+        start_epoch = 0
+        if self.resume_from_checkpoint:
+            checkpoint_path, resume_epoch = self._find_latest_checkpoint("cql")
+            if checkpoint_path and self._load_checkpoint(cql, checkpoint_path):
+                start_epoch = resume_epoch
+                print(f"🔄 Resuming CQL training from epoch {start_epoch}")
+
+                # Adjust remaining steps
+                completed_steps = start_epoch * n_steps_per_epoch
+                remaining_steps = max(0, n_steps - completed_steps)
+
+                if remaining_steps <= 0:
+                    print("✅ CQL training already completed!")
+                    return (
+                        cql,
+                        self.training_metrics["cql"]["epochs"],
+                        self.training_metrics["cql"]["metrics"],
+                    )
+
+                n_steps = remaining_steps
+                print(f"Remaining steps: {remaining_steps}")
+
+        # Setup evaluators
+        evaluators = self.setup_evaluators(lightweight=False)
+
+        # Evaluation callback with checkpoint saving
+        eval_frequency = 5 if self.fast_mode else 2
+
+        def evaluation_callback(algo, epoch, total_step):
+            actual_epoch = start_epoch + epoch
+
+            if epoch % eval_frequency == 0:
+                eval_results = self.evaluate_policy(
+                    algo, "cql", actual_epoch, n_trials=10
+                )
+                normalized_score = self.normalize_d4rl_score(
+                    eval_results["mean_score"]
+                )
+                eval_results["normalized_score"] = normalized_score
+
+                print(
+                    f"CQL Epoch {actual_epoch}: Raw Score = {eval_results['mean_score']:.2f}, "
+                    f"Normalized Score = {normalized_score:.2f}"
+                )
+
+                self.save_best_model(
+                    algo,
+                    "cql",
+                    eval_results["mean_score"],
+                    normalized_score,
+                    actual_epoch,
+                )
+
+            # Save checkpoints more frequently
+            if epoch % 20 == 0 and epoch > 0:
+                checkpoint_path = os.path.join(
+                    self.results_dir,
+                    f"cql_checkpoint_epoch_{actual_epoch}_{self.timestamp}.d3",
+                )
+                algo.save(checkpoint_path)
+                print(f"💾 CQL checkpoint saved at epoch {actual_epoch}")
+
+                # Also save current results
+                self.save_comprehensive_results()
+
+        print(f"Training CQL for {n_steps} steps...")
+        if start_epoch > 0:
+            print(f"Resuming from epoch {start_epoch}")
+
+        res = cql.fit(
+            self.dataset,
+            n_steps=n_steps,
+            n_steps_per_epoch=n_steps_per_epoch,
+            evaluators=evaluators,
+            experiment_name=f"improved_cql_walker2d_{self.timestamp}",
+            with_timestamp=False,
+            save_interval=20,
+            callback=evaluation_callback,
+        )
+
+        # Adjust epoch numbers for resumed training
+        epochs, metrics = zip(*res)
+        adjusted_epochs = [start_epoch + epoch for epoch in epochs]
+
+        # Update training metrics
+        if start_epoch > 0:
+            # Append to existing metrics
+            self.training_metrics["cql"]["epochs"].extend(adjusted_epochs)
+            self.training_metrics["cql"]["metrics"].extend(list(metrics))
+        else:
+            # Replace metrics
+            self.training_metrics["cql"]["epochs"] = adjusted_epochs
+            self.training_metrics["cql"]["metrics"] = list(metrics)
+
+        # Final evaluation
+        final_epoch = adjusted_epochs[-1] if adjusted_epochs else start_epoch
+        final_eval = self.evaluate_policy(cql, "cql", final_epoch, n_trials=20)
+        final_normalized = self.normalize_d4rl_score(final_eval["mean_score"])
+        final_eval["normalized_score"] = final_normalized
+        self.save_best_model(
+            cql, "cql", final_eval["mean_score"], final_normalized, final_epoch
+        )
+
+        return cql, adjusted_epochs, list(metrics)
+
+    def train_bc(self, n_steps: int = None, n_steps_per_epoch: int = None):
+        """Train BC model"""
+        print("\n" + "=" * 50)
+        print("TRAINING BC ALGORITHM")
+        print("=" * 50)
+
+        # Training parameters
+        if self.fast_mode:
+            n_steps = n_steps or 50000
+            n_steps_per_epoch = n_steps_per_epoch or 2500
+        else:
+            n_steps = n_steps or 200000
+            n_steps_per_epoch = n_steps_per_epoch or 5000
+
+        # Create BC configuration
+        bc_config = BCConfig(
+            learning_rate=1e-3,
+            batch_size=512 if self.device.startswith("cuda") else 256,
+        )
+
+        bc = bc_config.create(device=self.device)
+
+        # Check for checkpoint resumption
+        start_epoch = 0
+        if self.resume_from_checkpoint:
+            checkpoint_path, resume_epoch = self._find_latest_checkpoint("bc")
+            if checkpoint_path and self._load_checkpoint(bc, checkpoint_path):
+                start_epoch = resume_epoch
+                print(f"🔄 Resuming BC training from epoch {start_epoch}")
+
+                # Adjust remaining steps
+                completed_steps = start_epoch * n_steps_per_epoch
+                remaining_steps = max(0, n_steps - completed_steps)
+
+                if remaining_steps <= 0:
+                    print("✅ BC training already completed!")
+                    return (
+                        bc,
+                        self.training_metrics["bc"]["epochs"],
+                        self.training_metrics["bc"]["metrics"],
+                    )
+
+                n_steps = remaining_steps
+                print(f"Remaining steps: {remaining_steps}")
+
+        # Setup evaluators
+        evaluators = self.setup_evaluators(lightweight=False)
+
+        def evaluation_callback(algo, epoch, total_step):
+            actual_epoch = start_epoch + epoch
+
+            if epoch % 5 == 0:
+                eval_results = self.evaluate_policy(
+                    algo, "bc", actual_epoch, n_trials=10
+                )
+                normalized_score = self.normalize_d4rl_score(
+                    eval_results["mean_score"]
+                )
+                eval_results["normalized_score"] = normalized_score
+
+                print(
+                    f"BC Epoch {actual_epoch}: Raw Score = {eval_results['mean_score']:.2f}, "
+                    f"Normalized Score = {normalized_score:.2f}"
+                )
+
+                self.save_best_model(
+                    algo,
+                    "bc",
+                    eval_results["mean_score"],
+                    normalized_score,
+                    actual_epoch,
+                )
+
+            # Save checkpoints
+            if epoch % 10 == 0 and epoch > 0:  # Every 10 epochs for BC
+                checkpoint_path = os.path.join(
+                    self.results_dir,
+                    f"bc_checkpoint_epoch_{actual_epoch}_{self.timestamp}.d3",
+                )
+                algo.save(checkpoint_path)
+                print(f"💾 BC checkpoint saved at epoch {actual_epoch}")
+
+                # Also save current results
+                self.save_comprehensive_results()
+
+        print(f"Training BC for {n_steps} steps...")
+        if start_epoch > 0:
+            print(f"Resuming from epoch {start_epoch}")
+
+        res = bc.fit(
+            self.dataset,
+            n_steps=n_steps,
+            n_steps_per_epoch=n_steps_per_epoch,
+            evaluators=evaluators,
+            experiment_name=f"improved_bc_walker2d_{self.timestamp}",
+            with_timestamp=False,
+            callback=evaluation_callback,
+        )
+
+        # Adjust epoch numbers for resumed training
+        epochs, metrics = zip(*res)
+        adjusted_epochs = [start_epoch + epoch for epoch in epochs]
+
+        # Update training metrics
+        if start_epoch > 0:
+            # Append to existing metrics
+            self.training_metrics["bc"]["epochs"].extend(adjusted_epochs)
+            self.training_metrics["bc"]["metrics"].extend(list(metrics))
+        else:
+            # Replace metrics
+            self.training_metrics["bc"]["epochs"] = adjusted_epochs
+            self.training_metrics["bc"]["metrics"] = list(metrics)
+
+        # Final evaluation
+        final_epoch = adjusted_epochs[-1] if adjusted_epochs else start_epoch
+        final_eval = self.evaluate_policy(bc, "bc", final_epoch, n_trials=20)
+        final_normalized = self.normalize_d4rl_score(final_eval["mean_score"])
+        final_eval["normalized_score"] = final_normalized
+        self.save_best_model(
+            bc, "bc", final_eval["mean_score"], final_normalized, final_epoch
+        )
+
+        return bc, adjusted_epochs, list(metrics)
 
     def setup_evaluators(self, lightweight: bool = False):
         """Setup evaluators with optimizations"""
         if lightweight:
-            # Minimal evaluators for fast training
             return {
                 "environment": EnvironmentEvaluator(
                     self.eval_env,
-                    n_trials=3,
+                    n_trials=5,
                     epsilon=0.0,
                 )
             }
 
-        # Standard evaluators but with reduced complexity
+        # Comprehensive evaluators
         env_evaluator = EnvironmentEvaluator(
             self.eval_env,
-            n_trials=5,
+            n_trials=10,
             epsilon=0.0,
         )
 
-        # Use smaller subset for other evaluators
-        eval_episodes = self.dataset.episodes[:50]
+        eval_episodes = self.dataset.episodes[:100]
 
         td_error_evaluator = TDErrorEvaluator(episodes=eval_episodes)
         avg_value_evaluator = AverageValueEstimationEvaluator(
@@ -146,9 +581,9 @@ class OptimizedRLTrainer:
     def evaluate_policy(
         self, algo, algo_name: str, epoch: int, n_trials: int = None
     ):
-        """Optimized policy evaluation"""
+        """Enhanced policy evaluation with D4RL normalization"""
         if n_trials is None:
-            n_trials = 3 if self.fast_mode else 10
+            n_trials = 5 if self.fast_mode else 10
 
         print(
             f"\nEvaluating {algo_name} at epoch {epoch} ({n_trials} trials)..."
@@ -162,7 +597,7 @@ class OptimizedRLTrainer:
             total_reward = 0
             steps = 0
             done = False
-            max_steps = 500 if self.fast_mode else 1000
+            max_steps = 1000
 
             while not done and steps < max_steps:
                 if obs.ndim == 1:
@@ -193,12 +628,19 @@ class OptimizedRLTrainer:
             "lengths": eval_lengths,
         }
 
+        # Add normalized score
+        normalized_score = self.normalize_d4rl_score(
+            eval_results["mean_score"]
+        )
+        eval_results["normalized_score"] = normalized_score
+
         self.evaluation_results[algo_name].append(eval_results)
 
         print(f"{algo_name} Evaluation Results:")
         print(
-            f"  Mean Score: {eval_results['mean_score']:.2f} ± {eval_results['std_score']:.2f}"
+            f"  Raw Score: {eval_results['mean_score']:.2f} ± {eval_results['std_score']:.2f}"
         )
+        print(f"  D4RL Normalized Score: {normalized_score:.2f}")
         print(
             f"  Score Range: [{eval_results['min_score']:.2f}, {eval_results['max_score']:.2f}]"
         )
@@ -208,173 +650,89 @@ class OptimizedRLTrainer:
 
         return eval_results
 
-    def save_best_model(self, algo, algo_name: str, score: float, epoch: int):
+    def save_best_model(
+        self,
+        algo,
+        algo_name: str,
+        score: float,
+        normalized_score: float,
+        epoch: int,
+    ):
         """Save model if it's the best so far"""
-        if score > self.best_models[algo_name]["score"]:
+        if normalized_score > self.best_models[algo_name]["normalized_score"]:
             model_path = os.path.join(
                 self.results_dir, f"best_{algo_name}_model_{self.timestamp}.d3"
             )
             algo.save(model_path)
 
             self.best_models[algo_name].update(
-                {"score": score, "epoch": epoch, "model_path": model_path}
+                {
+                    "score": score,
+                    "normalized_score": normalized_score,
+                    "epoch": epoch,
+                    "model_path": model_path,
+                }
             )
 
+            print(f"🎉 NEW BEST {algo_name.upper()} MODEL!")
             print(
-                f"New best {algo_name} model saved! Score: {score:.2f} at epoch {epoch}"
+                f"   Raw Score: {score:.2f} | Normalized Score: {normalized_score:.2f} | Epoch: {epoch}"
             )
             return True
         return False
 
-    def train_cql(self, n_steps: int = None, n_steps_per_epoch: int = None):
-        """Train CQL algorithm with optimizations"""
-        print("\n" + "=" * 50)
-        print("TRAINING CQL ALGORITHM")
-        print("=" * 50)
-
-        # training parameters
-        if self.fast_mode:
-            n_steps = n_steps or 30000
-            n_steps_per_epoch = n_steps_per_epoch or 3000
-            print("Fast mode enabled - using reduced training steps")
-        else:
-            n_steps = n_steps or 100000
-            n_steps_per_epoch = n_steps_per_epoch or 10000
-
-        # Optimized CQL configuration
-        cql_config = CQLConfig(
-            actor_learning_rate=1e-3,
-            critic_learning_rate=1e-3,
-            temp_learning_rate=1e-3,
-            alpha_learning_rate=1e-3,
-            batch_size=(512 if self.device.startswith("cuda") else 256),
-            gamma=0.99,
-            tau=0.005,
-            n_critics=2,
-            initial_temperature=1.0,
-            initial_alpha=2.0,
-            alpha_threshold=5.0,
-            conservative_weight=2.0,
-            n_action_samples=5,
-            soft_q_backup=False,
-        )
-
-        cql = cql_config.create(device=self.device)
-
-        # Setup lightweight evaluators for fast training
-        evaluators = self.setup_evaluators(lightweight=self.fast_mode)
-
-        # Optimized training callback
-        eval_frequency = 3 if self.fast_mode else 1
-
-        def evaluation_callback(algo, epoch, total_step):
-            if epoch % eval_frequency == 0:
-                eval_results = self.evaluate_policy(algo, "cql", epoch)
-                self.save_best_model(
-                    algo, "cql", eval_results["mean_score"], epoch
-                )
-
-            # Save checkpoints less frequently
-            if epoch % 20 == 0:
-                checkpoint_path = os.path.join(
-                    self.results_dir,
-                    f"cql_checkpoint_epoch_{epoch}_{self.timestamp}.d3",
-                )
-                algo.save(checkpoint_path)
-
+    def run_complete_training(self):
+        """Run training pipeline with checkpoint resumption"""
         print(
-            f"Training CQL for {n_steps} steps ({n_steps//n_steps_per_epoch} epochs)..."
+            "🚀 Starting IMPROVED offline RL training pipeline with checkpoint resumption..."
         )
         print(f"Device: {self.device}")
+        print(f"Fast mode: {self.fast_mode}")
+        print(f"Resume from checkpoint: {self.resume_from_checkpoint}")
+        print(f"Results directory: {self.results_dir}")
 
-        epochs, metrics = cql.fit(
-            self.dataset,
-            n_steps=n_steps,
-            n_steps_per_epoch=n_steps_per_epoch,
-            evaluators=evaluators,
-            experiment_name=f"cql_walker2d_{self.timestamp}",
-            with_timestamp=False,
-            save_interval=10,
-            callback=evaluation_callback,
+        # Train with checkpoint resumption
+        cql_model, cql_epochs, cql_metrics = self.train_cql()
+        bc_model, bc_epochs, bc_metrics = self.train_bc()
+
+        # Save final results
+        self.save_comprehensive_results()
+
+        print("\n" + "=" * 70)
+        print("🎉 TRAINING COMPLETED WITH CHECKPOINT SUPPORT!")
+        print("=" * 70)
+        print(f"Best CQL Raw Score: {self.best_models['cql']['score']:.2f}")
+        print(
+            f"Best CQL D4RL Score: {self.best_models['cql']['normalized_score']:.2f}"
         )
-
-        self.training_metrics["cql"]["epochs"] = epochs
-        self.training_metrics["cql"]["metrics"] = metrics
-
-        # Final evaluation
-        final_eval = self.evaluate_policy(cql, "cql", len(epochs))
-        self.save_best_model(cql, "cql", final_eval["mean_score"], len(epochs))
-
-        return cql, epochs, metrics
-
-    def train_bc(self, n_steps: int = None, n_steps_per_epoch: int = None):
-        """Train BC algorithm"""
-        print("\n" + "=" * 50)
-        print("TRAINING BC ALGORITHM")
-        print("=" * 50)
-
-        # training parameters
-        if self.fast_mode:
-            n_steps = n_steps or 10000
-            n_steps_per_epoch = n_steps_per_epoch or 1000
-        else:
-            n_steps = n_steps or 20000
-            n_steps_per_epoch = n_steps_per_epoch or 2000
-
-        bc_config = BCConfig(
-            learning_rate=3e-3,
-            batch_size=512 if self.device.startswith("cuda") else 256,
-            weight_decay=1e-4,
+        print(f"Best BC Raw Score: {self.best_models['bc']['score']:.2f}")
+        print(
+            f"Best BC D4RL Score: {self.best_models['bc']['normalized_score']:.2f}"
         )
+        print(f"Results saved in: {self.results_dir}")
+        print("=" * 70)
 
-        bc = bc_config.create(device=self.device)
-
-        # Minimal evaluators for BC
-        evaluators = {
-            "environment": EnvironmentEvaluator(self.eval_env, n_trials=3),
+        return {
+            "cql_model": cql_model,
+            "bc_model": bc_model,
+            "results_dir": self.results_dir,
+            "timestamp": self.timestamp,
+            "device": self.device,
+            "best_scores": self.best_models,
         }
 
-        def evaluation_callback(algo, epoch, total_step):
-            if epoch % 2 == 0:
-                eval_results = self.evaluate_policy(algo, "bc", epoch)
-                self.save_best_model(
-                    algo, "bc", eval_results["mean_score"], epoch
-                )
-
-        print(
-            f"Training BC for {n_steps} steps ({n_steps//n_steps_per_epoch} epochs)..."
-        )
-        epochs, metrics = bc.fit(
-            self.dataset,
-            n_steps=n_steps,
-            n_steps_per_epoch=n_steps_per_epoch,
-            evaluators=evaluators,
-            experiment_name=f"bc_walker2d_{self.timestamp}",
-            with_timestamp=False,
-            callback=evaluation_callback,
-        )
-
-        self.training_metrics["bc"]["epochs"] = epochs
-        self.training_metrics["bc"]["metrics"] = metrics
-
-        # Final evaluation
-        final_eval = self.evaluate_policy(bc, "bc", len(epochs))
-        self.save_best_model(bc, "bc", final_eval["mean_score"], len(epochs))
-
-        return bc, epochs, metrics
-
     def save_comprehensive_results(self):
-        """Save all results to files"""
-        print("\n" + "=" * 50)
-        print("SAVING COMPREHENSIVE RESULTS")
-        print("=" * 50)
-
+        """Enhanced results saving with D4RL normalization"""
         results = {
             "timestamp": self.timestamp,
             "dataset_name": self.dataset_name,
             "env_name": self.env_name,
             "fast_mode": self.fast_mode,
             "device": self.device,
+            "d4rl_normalization": {
+                "min_score": self.min_score,
+                "max_score": self.max_score,
+            },
             "training_metrics": self.training_metrics,
             "evaluation_results": self.evaluation_results,
             "best_models": self.best_models,
@@ -388,26 +746,16 @@ class OptimizedRLTrainer:
 
         # Save JSON results
         json_path = os.path.join(
-            self.results_dir, f"optimized_results_{self.timestamp}.json"
+            self.results_dir, f"improved_results_{self.timestamp}.json"
         )
         with open(json_path, "w") as f:
             json_results = self._convert_numpy_to_list(results)
             json.dump(json_results, f, indent=2)
 
-        # Save pickle results
-        pickle_path = os.path.join(
-            self.results_dir, f"optimized_results_{self.timestamp}.pkl"
-        )
-        with open(pickle_path, "wb") as f:
-            pickle.dump(results, f)
+        # Create summary report
+        self._create_enhanced_summary_report()
 
-        self._create_evaluation_csv()
-        self._create_training_csv()
-        self._generate_plots()
-        self._create_summary_report()
-
-        print(f"✓ Results saved to: {json_path}")
-        print(f"✓ Results saved to: {pickle_path}")
+        print(f"✅ Enhanced results saved to: {json_path}")
 
     def _convert_numpy_to_list(self, obj):
         """Recursively convert numpy arrays to lists for JSON serialization"""
@@ -423,213 +771,369 @@ class OptimizedRLTrainer:
         else:
             return obj
 
-    def _create_evaluation_csv(self):
-        """Create CSV file with evaluation results"""
-        eval_data = []
-        for algo_name in ["cql", "bc"]:
-            for result in self.evaluation_results[algo_name]:
-                eval_data.append(
-                    {
-                        "algorithm": algo_name,
-                        "epoch": result["epoch"],
-                        "mean_score": result["mean_score"],
-                        "std_score": result["std_score"],
-                        "min_score": result["min_score"],
-                        "max_score": result["max_score"],
-                        "mean_length": result["mean_length"],
-                        "std_length": result["std_length"],
-                    }
-                )
-
-        df = pd.DataFrame(eval_data)
-        csv_path = os.path.join(
-            self.results_dir, f"evaluation_results_{self.timestamp}.csv"
-        )
-        df.to_csv(csv_path, index=False)
-        print(f"✓ Evaluation CSV saved to: {csv_path}")
-
-    def _create_training_csv(self):
-        """Create CSV file with training metrics"""
-        training_data = []
-        for algo_name in ["cql", "bc"]:
-            if self.training_metrics[algo_name]["epochs"]:
-                epochs = self.training_metrics[algo_name]["epochs"]
-                metrics = self.training_metrics[algo_name]["metrics"]
-
-                for epoch, metric_dict in zip(epochs, metrics):
-                    row = {"algorithm": algo_name, "epoch": epoch}
-                    if isinstance(metric_dict, dict):
-                        for key, value in metric_dict.items():
-                            row[key] = value
-                    training_data.append(row)
-
-        if training_data:
-            df = pd.DataFrame(training_data)
-            csv_path = os.path.join(
-                self.results_dir, f"training_metrics_{self.timestamp}.csv"
-            )
-            df.to_csv(csv_path, index=False)
-            print(f"✓ Training metrics CSV saved to: {csv_path}")
-
-    def _generate_plots(self):
-        """Generate optimized plots"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle(f"Training Results - {self.timestamp}", fontsize=14)
-
-        # Evaluation scores
-        ax1 = axes[0, 0]
-        for algo_name in ["cql", "bc"]:
-            if self.evaluation_results[algo_name]:
-                epochs = [
-                    r["epoch"] for r in self.evaluation_results[algo_name]
-                ]
-                scores = [
-                    r["mean_score"] for r in self.evaluation_results[algo_name]
-                ]
-                ax1.plot(
-                    epochs, scores, label=f"{algo_name.upper()}", marker="o"
-                )
-
-        ax1.set_xlabel("Epoch")
-        ax1.set_ylabel("Mean Score")
-        ax1.set_title("Evaluation Scores")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        # Episode lengths
-        ax2 = axes[0, 1]
-        for algo_name in ["cql", "bc"]:
-            if self.evaluation_results[algo_name]:
-                epochs = [
-                    r["epoch"] for r in self.evaluation_results[algo_name]
-                ]
-                lengths = [
-                    r["mean_length"]
-                    for r in self.evaluation_results[algo_name]
-                ]
-                ax2.plot(
-                    epochs, lengths, label=f"{algo_name.upper()}", marker="s"
-                )
-
-        ax2.set_xlabel("Epoch")
-        ax2.set_ylabel("Mean Episode Length")
-        ax2.set_title("Episode Lengths")
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        # Score distributions
-        ax3 = axes[1, 0]
-        for algo_name in ["cql", "bc"]:
-            if self.evaluation_results[algo_name]:
-                latest_scores = self.evaluation_results[algo_name][-1][
-                    "scores"
-                ]
-                ax3.hist(
-                    latest_scores,
-                    alpha=0.7,
-                    label=f"{algo_name.upper()}",
-                    bins=8,
-                )
-
-        ax3.set_xlabel("Score")
-        ax3.set_ylabel("Frequency")
-        ax3.set_title("Final Score Distributions")
-        ax3.legend()
-
-        # Best scores comparison
-        ax4 = axes[1, 1]
-        algorithms, best_scores = [], []
-        for algo_name in ["cql", "bc"]:
-            if self.best_models[algo_name]["score"] != -np.inf:
-                algorithms.append(algo_name.upper())
-                best_scores.append(self.best_models[algo_name]["score"])
-
-        if algorithms:
-            ax4.bar(algorithms, best_scores, color=["blue", "orange"])
-            ax4.set_ylabel("Best Score")
-            ax4.set_title("Best Scores Comparison")
-
-        plt.tight_layout()
-        plot_path = os.path.join(
-            self.results_dir, f"training_plots_{self.timestamp}.png"
-        )
-        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        print(f"Plots saved to: {plot_path}")
-
-    def _create_summary_report(self):
-        """Create a summary report"""
+    def _create_enhanced_summary_report(self):
+        """Create enhanced summary report with checkpoint information"""
         report_path = os.path.join(
-            self.results_dir, f"summary_report_{self.timestamp}.txt"
+            self.results_dir, f"enhanced_summary_{self.timestamp}.txt"
         )
 
         with open(report_path, "w") as f:
             f.write("=" * 70 + "\n")
-            f.write("OFFLINE RL TRAINING REPORT\n")
+            f.write(
+                "ENHANCED OFFLINE RL TRAINING REPORT WITH CHECKPOINT SUPPORT\n"
+            )
             f.write("=" * 70 + "\n\n")
 
             f.write(f"Timestamp: {self.timestamp}\n")
             f.write(f"Dataset: {self.dataset_name}\n")
             f.write(f"Environment: {self.env_name}\n")
             f.write(f"Fast Mode: {self.fast_mode}\n")
+            f.write(f"Resume from Checkpoint: {self.resume_from_checkpoint}\n")
             f.write(f"Device: {self.device}\n\n")
 
-            # Dataset info
-            f.write("DATASET INFO:\n")
+            # D4RL Normalization Info
+            f.write("D4RL NORMALIZATION:\n")
             f.write("-" * 30 + "\n")
-            f.write(f"Episodes: {len(self.dataset.episodes)}\n")
-            f.write(
-                f"Steps: {sum(len(ep) for ep in self.dataset.episodes)}\n\n"
-            )
+            f.write(f"Min Score (Random): {self.min_score:.2f}\n")
+            f.write(f"Max Score (Expert): {self.max_score:.2f}\n\n")
 
-            # Best models
-            f.write("BEST RESULTS:\n")
+            # Training Progress
+            f.write("TRAINING PROGRESS:\n")
+            f.write("-" * 30 + "\n")
+            if self.training_metrics["cql"]["epochs"]:
+                f.write(
+                    f"CQL Epochs Completed: {max(self.training_metrics['cql']['epochs'])}\n"
+                )
+            if self.training_metrics["bc"]["epochs"]:
+                f.write(
+                    f"BC Epochs Completed: {max(self.training_metrics['bc']['epochs'])}\n"
+                )
+            f.write("\n")
+
+            # Final results
+            f.write("FINAL RESULTS:\n")
             f.write("-" * 30 + "\n")
             for algo_name in ["cql", "bc"]:
                 best = self.best_models[algo_name]
                 if best["score"] != -np.inf:
+                    f.write(f"{algo_name.upper()}:\n")
+                    f.write(f"  Raw Score: {best['score']:.2f}\n")
                     f.write(
-                        f"{algo_name.upper()}: {best['score']:.2f} (epoch {best['epoch']})\n"
+                        f"  D4RL Normalized Score: {best['normalized_score']:.2f}\n"
                     )
+                    f.write(f"  Best Epoch: {best['epoch']}\n")
+                    f.write(f"  Model Path: {best['model_path']}\n\n")
 
-        print(f"Summary report saved to: {report_path}")
+            # Performance Assessment
+            f.write("PERFORMANCE ASSESSMENT:\n")
+            f.write("-" * 30 + "\n")
+            for algo_name in ["cql", "bc"]:
+                normalized_score = self.best_models[algo_name][
+                    "normalized_score"
+                ]
+                if normalized_score > 80:
+                    assessment = "EXCELLENT"
+                elif normalized_score > 60:
+                    assessment = "GOOD"
+                elif normalized_score > 40:
+                    assessment = "FAIR"
+                elif normalized_score > 20:
+                    assessment = "POOR"
+                else:
+                    assessment = "VERY POOR"
 
-    def run_complete_training(self):
-        """Run optimized training pipeline"""
-        print("🚀 Starting offline RL training pipeline...")
-        print(f"Device: {self.device}")
-        print(f"Fast mode: {self.fast_mode}")
-        print(f"Results directory: {self.results_dir}")
+                f.write(
+                    f"{algo_name.upper()}: {assessment} ({normalized_score:.2f})\n"
+                )
 
-        cql_model, cql_epochs, cql_metrics = self.train_cql()
-        bc_model, bc_epochs, bc_metrics = self.train_bc()
-        self.save_comprehensive_results()
+            f.write("\n")
 
-        print("\n" + "=" * 60)
-        print("TRAINING COMPLETED!")
-        print("=" * 60)
-        print(f"Best CQL Score: {self.best_models['cql']['score']:.2f}")
-        print(f"Best BC Score: {self.best_models['bc']['score']:.2f}")
-        print(f"Device used: {self.device}")
-        print(f"Results saved in: {self.results_dir}")
-        print("=" * 60)
+            # Dataset Statistics
+            f.write("DATASET STATISTICS:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Number of Episodes: {len(self.dataset.episodes)}\n")
+            f.write(
+                f"Total Steps: {sum(len(ep) for ep in self.dataset.episodes)}\n"
+            )
+            f.write(f"Action Space: {self.env.action_space}\n")
+            f.write(f"Observation Space: {self.env.observation_space}\n\n")
 
-        return {
-            "cql_model": cql_model,
-            "bc_model": bc_model,
-            "results_dir": self.results_dir,
-            "timestamp": self.timestamp,
-            "device": self.device,
+            # Training Configuration
+            f.write("TRAINING CONFIGURATION:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"Device Used: {self.device}\n")
+            f.write(f"Fast Mode: {self.fast_mode}\n")
+            f.write(f"Checkpoint Resumption: {self.resume_from_checkpoint}\n")
+            f.write(f"Results Directory: {self.results_dir}\n\n")
+
+            # Evaluation Summary
+            f.write("EVALUATION SUMMARY:\n")
+            f.write("-" * 30 + "\n")
+            for algo_name in ["cql", "bc"]:
+                evaluations = self.evaluation_results[algo_name]
+                if evaluations:
+                    f.write(
+                        f"{algo_name.upper()} - {len(evaluations)} evaluations performed\n"
+                    )
+                    best_eval = max(
+                        evaluations, key=lambda x: x["normalized_score"]
+                    )
+                    f.write(
+                        f"  Best Performance: {best_eval['normalized_score']:.2f} at epoch {best_eval['epoch']}\n"
+                    )
+            f.write("\n")
+
+            # Recommendations
+            f.write("RECOMMENDATIONS:\n")
+            f.write("-" * 30 + "\n")
+            cql_score = self.best_models["cql"]["normalized_score"]
+            bc_score = self.best_models["bc"]["normalized_score"]
+
+            if cql_score > bc_score:
+                f.write(
+                    "• CQL outperformed BC - Consider using CQL for deployment\n"
+                )
+            else:
+                f.write(
+                    "• BC outperformed CQL - Consider using BC for deployment\n"
+                )
+
+            if max(cql_score, bc_score) < 40:
+                f.write("• Low performance detected - Consider:\n")
+                f.write("  - Increasing training steps\n")
+                f.write("  - Tuning hyperparameters\n")
+                f.write("  - Using different dataset or algorithm\n")
+            elif max(cql_score, bc_score) < 60:
+                f.write(
+                    "• Moderate performance - Consider hyperparameter tuning\n"
+                )
+            else:
+                f.write("• Good performance achieved!\n")
+
+        print(f"✅ Enhanced summary report saved to: {report_path}")
+
+    def create_visualization_plots(self):
+        """Create comprehensive visualization plots"""
+        plt.style.use(
+            "seaborn-v0_8"
+            if "seaborn-v0_8" in plt.style.available
+            else "default"
+        )
+
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle(
+            f"Offline RL Training Results - {self.timestamp}",
+            fontsize=16,
+            fontweight="bold",
+        )
+
+        # Plot 1: Training Progress (Normalized Scores)
+        ax1 = axes[0, 0]
+        for algo_name in ["cql", "bc"]:
+            evaluations = self.evaluation_results[algo_name]
+            if evaluations:
+                epochs = [eval_result["epoch"] for eval_result in evaluations]
+                scores = [
+                    eval_result["normalized_score"]
+                    for eval_result in evaluations
+                ]
+                ax1.plot(
+                    epochs,
+                    scores,
+                    marker="o",
+                    label=f"{algo_name.upper()}",
+                    linewidth=2,
+                    markersize=4,
+                )
+
+        ax1.set_xlabel("Training Epoch")
+        ax1.set_ylabel("D4RL Normalized Score")
+        ax1.set_title("Training Progress (D4RL Normalized)")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # Plot 2: Raw Score Distribution
+        ax2 = axes[0, 1]
+        for algo_name in ["cql", "bc"]:
+            evaluations = self.evaluation_results[algo_name]
+            if evaluations:
+                # Get all individual scores from all evaluations
+                all_scores = []
+                for eval_result in evaluations:
+                    all_scores.extend(eval_result["scores"])
+                ax2.hist(
+                    all_scores,
+                    alpha=0.7,
+                    label=f"{algo_name.upper()}",
+                    bins=20,
+                    density=True,
+                )
+
+        ax2.set_xlabel("Raw Score")
+        ax2.set_ylabel("Density")
+        ax2.set_title("Score Distribution")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+
+        # Plot 3: Episode Length Analysis
+        ax3 = axes[1, 0]
+        for algo_name in ["cql", "bc"]:
+            evaluations = self.evaluation_results[algo_name]
+            if evaluations:
+                epochs = [eval_result["epoch"] for eval_result in evaluations]
+                lengths = [
+                    eval_result["mean_length"] for eval_result in evaluations
+                ]
+                ax3.plot(
+                    epochs,
+                    lengths,
+                    marker="s",
+                    label=f"{algo_name.upper()}",
+                    linewidth=2,
+                    markersize=4,
+                )
+
+        ax3.set_xlabel("Training Epoch")
+        ax3.set_ylabel("Mean Episode Length")
+        ax3.set_title("Episode Length Progress")
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+
+        # Plot 4: Performance Comparison
+        ax4 = axes[1, 1]
+        algos = []
+        raw_scores = []
+        normalized_scores = []
+
+        for algo_name in ["cql", "bc"]:
+            if self.best_models[algo_name]["score"] != -np.inf:
+                algos.append(algo_name.upper())
+                raw_scores.append(self.best_models[algo_name]["score"])
+                normalized_scores.append(
+                    self.best_models[algo_name]["normalized_score"]
+                )
+
+        if algos:
+            x_pos = np.arange(len(algos))
+            width = 0.35
+
+            ax4.bar(
+                x_pos - width / 2,
+                raw_scores,
+                width,
+                label="Raw Score",
+                alpha=0.8,
+            )
+            ax4_twin = ax4.twinx()
+            ax4_twin.bar(
+                x_pos + width / 2,
+                normalized_scores,
+                width,
+                label="D4RL Normalized",
+                alpha=0.8,
+                color="orange",
+            )
+
+            ax4.set_xlabel("Algorithm")
+            ax4.set_ylabel("Raw Score", color="blue")
+            ax4_twin.set_ylabel("D4RL Normalized Score", color="orange")
+            ax4.set_title("Best Performance Comparison")
+            ax4.set_xticks(x_pos)
+            ax4.set_xticklabels(algos)
+
+            # Add value labels on bars
+            for i, (raw, norm) in enumerate(
+                zip(raw_scores, normalized_scores)
+            ):
+                ax4.text(
+                    i - width / 2,
+                    raw + max(raw_scores) * 0.01,
+                    f"{raw:.1f}",
+                    ha="center",
+                    va="bottom",
+                )
+                ax4_twin.text(
+                    i + width / 2,
+                    norm + max(normalized_scores) * 0.01,
+                    f"{norm:.1f}",
+                    ha="center",
+                    va="bottom",
+                )
+
+        plt.tight_layout()
+
+        # Save the plot
+        plot_path = os.path.join(
+            self.results_dir, f"training_analysis_{self.timestamp}.png"
+        )
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+
+        print(f"✅ Visualization plots saved to: {plot_path}")
+        return plot_path
+
+    def generate_training_report(self):
+        """Generate a comprehensive training report with all results"""
+        report_data = {
+            "training_summary": {
+                "timestamp": self.timestamp,
+                "dataset": self.dataset_name,
+                "environment": self.env_name,
+                "device": self.device,
+                "fast_mode": self.fast_mode,
+                "resume_checkpoint": self.resume_from_checkpoint,
+            },
+            "best_performances": self.best_models,
+            "training_progress": {
+                "cql_evaluations": len(self.evaluation_results["cql"]),
+                "bc_evaluations": len(self.evaluation_results["bc"]),
+                "total_epochs": {
+                    "cql": (
+                        max(self.training_metrics["cql"]["epochs"])
+                        if self.training_metrics["cql"]["epochs"]
+                        else 0
+                    ),
+                    "bc": (
+                        max(self.training_metrics["bc"]["epochs"])
+                        if self.training_metrics["bc"]["epochs"]
+                        else 0
+                    ),
+                },
+            },
+            "dataset_info": {
+                "num_episodes": len(self.dataset.episodes),
+                "total_steps": sum(len(ep) for ep in self.dataset.episodes),
+                "d4rl_normalization": {
+                    "min_score": self.min_score,
+                    "max_score": self.max_score,
+                },
+            },
         }
+
+        return report_data
+
+
+def main():
+    """Main function to run the RL trainer"""
+
+    print("=" * 60)
+    print("Training started...")
+    print("=" * 60)
+
+    trainer = ImprovedRLTrainer(
+        dataset_name="mujoco/walker2d/medium-v0",
+        env_name="Walker2d-v5",
+        results_dir="improved_results",
+        fast_mode=True,
+        resume_from_checkpoint=True,
+    )
+
+    results_resumed = trainer.run_complete_training()
+
+    return results_resumed
 
 
 if __name__ == "__main__":
-    trainer = OptimizedRLTrainer(
-        dataset_name="mujoco/walker2d/medium-v0",
-        env_name="Walker2d-v5",
-        results_dir="walker2d_results",
-        fast_mode=True,
-    )
-
-    results = trainer.run_complete_training()
-    print(f"\n✅ Training completed! Check: {results['results_dir']}")
+    # Run the training pipeline
+    fresh_results, resumed_results = main()
