@@ -13,8 +13,10 @@ build/
 *.log
 *.lock
 *.gif
-experiments/*
+experiment_results/
+checkpoints/
 !experiments/.gitkeep
 data/*
 !data/.gitkeep
-**/d3rlpy_logs/**
+**/d3rlpy_logs/
+runs/
